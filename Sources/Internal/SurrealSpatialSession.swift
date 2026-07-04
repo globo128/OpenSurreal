@@ -77,6 +77,16 @@ final class SurrealSpatialSession {
     var smoothingTuning = CalibrationSmoother.Tuning()
     private var smoothers: [UUID: CalibrationSmoother] = [:]
 
+    // Post-pickup recovery: for a short window after a controller transitions back
+    // to held, the calibration snaps to the wrist every frame instead of smoothing
+    // toward it. A controller's own tracking is often transient right after it
+    // starts moving again (bias re-estimation after sitting still), and the smoother
+    // deliberately passes device motion through — per-frame snapping masks the
+    // transient, at the cost of unfiltered wrist jitter for the window.
+    private let reacquisitionWindow: TimeInterval = 2.0
+    private var lastHeld: [UUID: Bool] = [:]
+    private var recoveryUntil: [UUID: TimeInterval] = [:]
+
     private let arSession = ARKitSession()
     private let handTracking = HandTrackingProvider()
     private var tracked: [UUID: SurrealController] = [:]
@@ -88,9 +98,14 @@ final class SurrealSpatialSession {
     private let holdWindow = 45                    // ~0.5 s at 90 Hz
     private let holdMotionThreshold: Float = 0.06  // hand must move ≥6 cm to judge
     private let holdRatioThreshold: Float = 0.6    // controller must move ≥60% as far
+    // A controller whose orientation swept at least this much within the window is
+    // in a hand — one lying on a surface can't rotate. Attitude is gyro-derived and
+    // trustworthy even while position tracking is still re-converging after pickup.
+    private let holdRotationThreshold: Float = 15 * .pi / 180
 
     private struct MotionBuffer {
         var controllerPositions: [SIMD3<Float>] = []
+        var controllerOrientations: [simd_quatf] = []
         var handPositions: [SIMD3<Float>] = []
     }
 
@@ -107,6 +122,8 @@ final class SurrealSpatialSession {
         tracked[controller.id] = nil
         holdBuffers[controller.id] = nil
         smoothers[controller.id] = nil
+        lastHeld[controller.id] = nil
+        recoveryUntil[controller.id] = nil
         controller.setHandAuthoritative(false)
         controller.clearCalibration()
     }
@@ -172,14 +189,30 @@ final class SurrealSpatialSession {
             // Held/released detection: if the hand moves but the controller doesn't,
             // it's been set down — pause authority so the pose doesn't chase the empty
             // hand, leaving the controller frozen where it sits.
-            accumulateHold(controllerID: controller.id, controllerPosition: pose.position, handPosition: wristPosition)
+            accumulateHold(
+                controllerID: controller.id,
+                controllerPosition: pose.position,
+                controllerOrientation: pose.orientation,
+                handPosition: wristPosition
+            )
             if let held = detectHeld(controllerID: controller.id) {
-                controller.setHeld(held)
+                // Don't trust a "set down" verdict while position tracking is still
+                // re-converging right after a pickup — under-reported controller
+                // motion reads as "hand moves, controller doesn't".
+                let inRecovery = update.timestamp < (recoveryUntil[controller.id] ?? 0)
+                if held || !inRecovery {
+                    controller.setHeld(held)
+                }
             }
             guard controller.isHeld else {
                 controller.setHandAuthoritative(false)
+                lastHeld[controller.id] = false
                 continue
             }
+            if lastHeld[controller.id] == false {
+                recoveryUntil[controller.id] = update.timestamp + reacquisitionWindow
+            }
+            lastHeld[controller.id] = true
 
             // The wrist is authoritative. Build the world pose target from it —
             // position from the wrist (pushed forward onto the controller body, plus a
@@ -199,14 +232,22 @@ final class SurrealSpatialSession {
 
             var worldFromController = simd_float4x4(orientation)
             worldFromController.columns.3 = SIMD4<Float>(position.x, position.y, position.z, 1)
-            var smoother = smoothers[controller.id] ?? CalibrationSmoother()
-            let calibration = smoother.update(
-                target: worldFromController,
-                devicePose: pose.matrix,
-                now: update.timestamp,
-                tuning: smoothingTuning
-            )
-            smoothers[controller.id] = smoother
+            let calibration: simd_float4x4
+            if let recovery = recoveryUntil[controller.id], update.timestamp < recovery {
+                // Reacquiring after pickup: snap, and discard the smoother so it
+                // re-seeds cleanly (its first update snaps) once the window ends.
+                smoothers[controller.id] = nil
+                calibration = worldFromController * pose.matrix.inverse
+            } else {
+                var smoother = smoothers[controller.id] ?? CalibrationSmoother()
+                calibration = smoother.update(
+                    target: worldFromController,
+                    devicePose: pose.matrix,
+                    now: update.timestamp,
+                    tuning: smoothingTuning
+                )
+                smoothers[controller.id] = smoother
+            }
             controller.setCalibration(calibration)
             controller.setHandAuthoritative(true)
         }
@@ -275,25 +316,40 @@ final class SurrealSpatialSession {
         )
     }
 
-    private func accumulateHold(controllerID: UUID, controllerPosition: SIMD3<Float>, handPosition: SIMD3<Float>) {
+    private func accumulateHold(controllerID: UUID, controllerPosition: SIMD3<Float>, controllerOrientation: simd_quatf, handPosition: SIMD3<Float>) {
         var buffer = holdBuffers[controllerID] ?? MotionBuffer()
         buffer.controllerPositions.append(controllerPosition)
+        buffer.controllerOrientations.append(controllerOrientation)
         buffer.handPositions.append(handPosition)
         if buffer.controllerPositions.count > holdWindow {
             buffer.controllerPositions.removeFirst()
+            buffer.controllerOrientations.removeFirst()
             buffer.handPositions.removeFirst()
         }
         holdBuffers[controllerID] = buffer
     }
 
     /// Held if, over the recent window, the controller moved a comparable amount to
-    /// the hand. Returns nil (indeterminate) when the hand barely moved.
+    /// the hand — or visibly rotated, which a controller lying on a surface can't
+    /// do. Returns nil (indeterminate) when the hand barely moved.
     private func detectHeld(controllerID: UUID) -> Bool? {
         guard let buffer = holdBuffers[controllerID], buffer.handPositions.count >= 15 else { return nil }
         let handSpread = spread3D(buffer.handPositions)
         guard handSpread >= holdMotionThreshold else { return nil }
         let controllerSpread = spread3D(buffer.controllerPositions)
-        return controllerSpread >= holdRatioThreshold * handSpread
+        if controllerSpread >= holdRatioThreshold * handSpread { return true }
+        return rotationSpread(buffer.controllerOrientations) >= holdRotationThreshold
+    }
+
+    /// Largest angle (radians) any orientation in the window makes with the first.
+    private func rotationSpread(_ orientations: [simd_quatf]) -> Float {
+        guard let first = orientations.first else { return 0 }
+        var maxAngle: Float = 0
+        for orientation in orientations {
+            let dot = min(abs(simd_dot(first.vector, orientation.vector)), 1)
+            maxAngle = Swift.max(maxAngle, 2 * acos(dot))
+        }
+        return maxAngle
     }
 
     /// Diagonal of the 3D bounding box of a set of positions.
