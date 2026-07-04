@@ -1,7 +1,19 @@
 import Foundation
 import CoreBluetooth
+import QuartzCore
 import simd
 import os
+
+/// The calibration transform plus the velocity of the calibration frame itself,
+/// tracked by a spatial session (see ``CalibrationMotionTracker`` for why the frame's
+/// motion matters).
+struct CalibrationState {
+    var worldFromControllerFrame: simd_float4x4
+    /// Translation rate of the calibration frame, world axes, m/s.
+    var linearVelocity = SIMD3<Float>.zero
+    /// Angular rate of the calibration frame, world axes, rad/s.
+    var angularVelocity = SIMD3<Float>.zero
+}
 
 /// A connected Surreal controller. Created by ``SurrealCentral`` and driven by a
 /// ``SurrealControllerSession``; not part of the public API.
@@ -54,7 +66,7 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
 
     // Lock-backed spatial state — readable/writable from any thread (the BLE queue
     // produces poses; a spatial session updates the calibration).
-    private let calibrationStore = OSAllocatedUnfairLock<simd_float4x4?>(initialState: nil)
+    private let calibrationStore = OSAllocatedUnfairLock<CalibrationState?>(initialState: nil)
     private let latestPoseStore = OSAllocatedUnfairLock<ControllerPose?>(initialState: nil)
     private let isHeldStore = OSAllocatedUnfairLock<Bool>(initialState: true)
     private let handAuthoritativeStore = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -67,6 +79,7 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
     private var vibrationCharacteristic: CBCharacteristic?
     private var batteryCharacteristic: CBCharacteristic?
     private var vibrationSequence: UInt16 = 0
+    private var clockSync = DeviceClockSync()
     private var prepareContinuation: CheckedContinuation<Void, Error>?
     private var writeContinuation: CheckedContinuation<Void, Error>?
     private var disconnectWaiters: [CheckedContinuation<Void, Never>] = []
@@ -129,7 +142,7 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
 
     /// The calibration transform (`worldFromControllerFrame`) currently applied to
     /// produce ``worldPoses``, or nil if uncalibrated.
-    var calibration: simd_float4x4? { calibrationStore.withLock { $0 } }
+    var calibration: simd_float4x4? { calibrationStore.withLock { $0?.worldFromControllerFrame } }
 
     /// Whether the controller is currently held (vs set down). Inferred by a spatial
     /// session from motion coherence; defaults to `true`.
@@ -163,10 +176,32 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
     }
 
     /// Sets the calibration that maps the controller's tracking frame into the
-    /// headset world frame. Subsequent samples are emitted on ``worldPoses``.
-    /// Thread-safe; a spatial session may call this continuously to correct drift.
-    func setCalibration(_ worldFromControllerFrame: simd_float4x4) {
-        calibrationStore.withLock { $0 = worldFromControllerFrame }
+    /// headset world frame, along with the frame's own current velocity (its
+    /// re-registration motion — folded into emitted world velocities). Subsequent
+    /// samples are emitted on ``worldPoses``. Thread-safe; a spatial session calls
+    /// this continuously to correct drift.
+    func setCalibration(
+        _ worldFromControllerFrame: simd_float4x4,
+        linearVelocity: SIMD3<Float> = .zero,
+        angularVelocity: SIMD3<Float> = .zero
+    ) {
+        calibrationStore.withLock {
+            $0 = CalibrationState(
+                worldFromControllerFrame: worldFromControllerFrame,
+                linearVelocity: linearVelocity,
+                angularVelocity: angularVelocity
+            )
+        }
+    }
+
+    /// Zeroes the calibration frame's velocity while keeping the transform — call
+    /// when the frame freezes (wrist authority lost) so the last re-registration
+    /// motion doesn't keep leaking into world velocities while coasting.
+    func freezeCalibrationMotion() {
+        calibrationStore.withLock {
+            $0?.linearVelocity = .zero
+            $0?.angularVelocity = .zero
+        }
     }
 
     /// Clears the calibration; ``worldPoses`` stops emitting until one is set again.
@@ -386,18 +421,41 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
         switch characteristic.uuid {
         case SurrealProtocol.poseCharacteristicUUID:
             if let pose = try? ControllerPose(packet: data, handedness: handedness) {
+                // Stamp arrival here, on the CoreBluetooth queue — the closest point
+                // to the radio — so scheduling hops don't pollute the clock-offset
+                // estimate.
+                let sampleTime = clockSync.sampleTime(
+                    deviceTimestamp: pose.timestamp,
+                    receivedAt: CACurrentMediaTime()
+                )
                 poseContinuation.yield(pose)
                 latestPoseStore.withLock { $0 = pose }
                 if let calibration = calibrationStore.withLock({ $0 }) {
-                    // Velocities are in the controller frame; rotate (not translate)
-                    // them into world axes by the calibration's rotation part. The
-                    // calibration is always a rigid rotation+translation, so its 3×3
-                    // is a pure rotation.
+                    let frame = calibration.worldFromControllerFrame
+                    // Device velocities are in the controller frame; rotate (not
+                    // translate) them into world axes by the calibration's rotation
+                    // part. The calibration is always a rigid rotation+translation,
+                    // so its 3×3 is a pure rotation.
                     let rotation = simd_float3x3(
-                        SIMD3(calibration.columns.0.x, calibration.columns.0.y, calibration.columns.0.z),
-                        SIMD3(calibration.columns.1.x, calibration.columns.1.y, calibration.columns.1.z),
-                        SIMD3(calibration.columns.2.x, calibration.columns.2.y, calibration.columns.2.z)
+                        SIMD3(frame.columns.0.x, frame.columns.0.y, frame.columns.0.z),
+                        SIMD3(frame.columns.1.x, frame.columns.1.y, frame.columns.1.z),
+                        SIMD3(frame.columns.2.x, frame.columns.2.y, frame.columns.2.z)
                     )
+                    let transform = frame * pose.matrix
+                    // Complete world velocity composes the device's own motion with
+                    // the calibration frame's motion: for a point carried by a moving
+                    // frame, ṗ_w = R·v_d + v_frame + ω_frame × (p_w − t_frame).
+                    let worldPosition = SIMD3(
+                        transform.columns.3.x, transform.columns.3.y, transform.columns.3.z
+                    )
+                    let frameOrigin = SIMD3(
+                        frame.columns.3.x, frame.columns.3.y, frame.columns.3.z
+                    )
+                    let linearVelocity = rotation * pose.linearVelocity
+                        + calibration.linearVelocity
+                        + simd_cross(calibration.angularVelocity, worldPosition - frameOrigin)
+                    let angularVelocity = rotation * pose.angularVelocity
+                        + calibration.angularVelocity
                     // While the wrist is authoritative the calibration is refreshed
                     // from it every frame, so `calibration · pose` is the wrist pose;
                     // report full confidence. Otherwise the controller is coasting on
@@ -405,11 +463,12 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
                     let confidence = handAuthoritativeStore.withLock { $0 } ? 1.0 : pose.confidence
                     let world = WorldPose(
                         handedness: handedness,
-                        transform: calibration * pose.matrix,
+                        transform: transform,
                         timestamp: pose.timestamp,
+                        sampleTime: sampleTime,
                         confidence: confidence,
-                        linearVelocity: rotation * pose.linearVelocity,
-                        angularVelocity: rotation * pose.angularVelocity,
+                        linearVelocity: linearVelocity,
+                        angularVelocity: angularVelocity,
                         acceleration: rotation * pose.acceleration
                     )
                     worldPoseContinuation.yield(world)

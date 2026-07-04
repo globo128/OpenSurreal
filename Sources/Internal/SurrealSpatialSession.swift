@@ -77,6 +77,11 @@ final class SurrealSpatialSession {
     var smoothingTuning = CalibrationSmoother.Tuning()
     private var smoothers: [UUID: CalibrationSmoother] = [:]
 
+    // Velocity of the calibration frame itself, per controller — the re-registration
+    // motion that device-reported velocities can't see. Fed to the controller with
+    // each calibration so emitted world velocities are complete.
+    private var calibrationMotion: [UUID: CalibrationMotionTracker] = [:]
+
     // Post-pickup recovery: for a short window after a controller transitions back
     // to held, the calibration snaps to the wrist every frame instead of smoothing
     // toward it. A controller's own tracking is often transient right after it
@@ -122,6 +127,7 @@ final class SurrealSpatialSession {
         tracked[controller.id] = nil
         holdBuffers[controller.id] = nil
         smoothers[controller.id] = nil
+        calibrationMotion[controller.id] = nil
         lastHeld[controller.id] = nil
         recoveryUntil[controller.id] = nil
         controller.setHandAuthoritative(false)
@@ -178,6 +184,10 @@ final class SurrealSpatialSession {
                   let wristTransform = wristWorldTransform(hand)
             else {
                 controller.setHandAuthoritative(false)
+                // Frozen calibration = motionless calibration; don't let the last
+                // re-registration velocity keep leaking into world velocities.
+                calibrationMotion[controller.id]?.reset()
+                controller.freezeCalibrationMotion()
                 continue
             }
 
@@ -206,6 +216,8 @@ final class SurrealSpatialSession {
             }
             guard controller.isHeld else {
                 controller.setHandAuthoritative(false)
+                calibrationMotion[controller.id]?.reset()
+                controller.freezeCalibrationMotion()
                 lastHeld[controller.id] = false
                 continue
             }
@@ -248,7 +260,17 @@ final class SurrealSpatialSession {
                 )
                 smoothers[controller.id] = smoother
             }
-            controller.setCalibration(calibration)
+            // Track the calibration frame's own motion so the controller can fold it
+            // into emitted world velocities (device velocities can't see it).
+            var motion = calibrationMotion[controller.id] ?? CalibrationMotionTracker()
+            motion.update(calibration, at: update.timestamp)
+            calibrationMotion[controller.id] = motion
+
+            controller.setCalibration(
+                calibration,
+                linearVelocity: motion.linearVelocity,
+                angularVelocity: motion.angularVelocity
+            )
             controller.setHandAuthoritative(true)
         }
     }
