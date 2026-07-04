@@ -16,7 +16,8 @@ import simd
 public struct ControllerPose: Sendable, Equatable {
     /// Which hand produced this pose.
     public let handedness: Handedness
-    /// Device timestamp in firmware-defined units (microseconds on current firmware).
+    /// Device timestamp in firmware-defined units (nanoseconds on current firmware:
+    /// consecutive packets are ~9.5e6 ticks apart at ~105 Hz).
     public let timestamp: UInt64
     /// Position `(x, y, z)`, right-handed.
     public let position: SIMD3<Float>
