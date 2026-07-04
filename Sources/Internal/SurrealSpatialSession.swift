@@ -16,7 +16,10 @@ import simd
 ///   points the right way,
 /// - registers the controller's calibration so `calibration · pose` reproduces that
 ///   pose, which also means the controller carries on seamlessly from the same place
-///   the instant the wrist is lost,
+///   the instant the wrist is lost. The registration runs through a
+///   ``CalibrationSmoother`` so wrist-tracking jitter doesn't shake the world poses:
+///   noise-sized disagreements are damped hard while real motion (carried by the
+///   controller's own tracking) passes through with no added lag,
 /// - marks the controller hand-authoritative so its world poses report confidence 1.
 ///
 /// When the wrist isn't tracked (or the controller has been set down) the calibration
@@ -49,21 +52,30 @@ final class SurrealSpatialSession {
     /// `yaw · pitch · roll`. The base rotation (see ``baseWristOffset(for:)``) already
     /// makes the body −Z point forward; use these to dial in the exact grip (e.g. roll
     /// to level the controller, since roll is about the body's own forward axis).
-    /// Default 0.
-    var leftWristOrientationOffsetDegrees = SIMD3<Float>(repeating: 0)
-    var rightWristOrientationOffsetDegrees = SIMD3<Float>(repeating: 0)
+    /// The yaw defaults cancel a measured mirrored inward bias of the base rotations
+    /// (positive yaw turns the body's pointing direction toward the player's left,
+    /// when pointing forward). The pitch component is driven by the session's public
+    /// `pitchAdjustmentDegrees`.
+    var leftWristOrientationOffsetDegrees = SIMD3<Float>(0, 0, 0)
+    var rightWristOrientationOffsetDegrees = SIMD3<Float>(0, 0, 0)
 
     /// Static heading (yaw) tweak applied about **world up**, per hand, in degrees.
     /// Positive turns the controller's pointing direction toward the player's left.
-    /// Defaults toe each controller 5° inward (left turns right, right turns left).
-    var leftStaticYawDegrees: Float = -7.5
-    var rightStaticYawDegrees: Float = 7.5
+    /// Default 0 (no toe-in) — an outstretched hand should render an outstretched
+    /// controller; grip alignment errors belong in the body-frame trims above.
+    var leftStaticYawDegrees: Float = 0
+    var rightStaticYawDegrees: Float = 0
 
     /// Static **world-space** position nudge added to the world pose, per hand, in
     /// metres (world axes: +X = player's right, +Y = up, −Z = forward). Defaults shift
     /// each controller 4 cm inward (left moves right, right moves left).
     var leftStaticPositionOffset = SIMD3<Float>(0.04, 0, 0)
     var rightStaticPositionOffset = SIMD3<Float>(-0.04, 0, 0)
+
+    /// Adaptive smoothing of the wrist-derived calibration, per controller — damps
+    /// hand-tracking jitter without lagging real motion (see ``CalibrationSmoother``).
+    var smoothingTuning = CalibrationSmoother.Tuning()
+    private var smoothers: [UUID: CalibrationSmoother] = [:]
 
     private let arSession = ARKitSession()
     private let handTracking = HandTrackingProvider()
@@ -94,6 +106,7 @@ final class SurrealSpatialSession {
     func untrack(_ controller: SurrealController) {
         tracked[controller.id] = nil
         holdBuffers[controller.id] = nil
+        smoothers[controller.id] = nil
         controller.setHandAuthoritative(false)
         controller.clearCalibration()
     }
@@ -168,12 +181,14 @@ final class SurrealSpatialSession {
                 continue
             }
 
-            // The wrist is authoritative. Build the world pose from it — position from
-            // the wrist (pushed forward onto the controller body, plus a static world
-            // nudge), orientation from the wrist composed with the fixed correction and
-            // a static heading tweak about world up — and register the calibration so
-            // `calibration · pose` reproduces it. Because the calibration is exact, the
-            // controller carries on from this same pose the instant the wrist drops.
+            // The wrist is authoritative. Build the world pose target from it —
+            // position from the wrist (pushed forward onto the controller body, plus a
+            // static world nudge), orientation from the wrist composed with the fixed
+            // correction and a static heading tweak about world up — then register the
+            // calibration through the smoother, which damps wrist jitter while letting
+            // real motion ride the controller's own tracking at full rate. The frozen
+            // calibration also means the controller carries on from the same pose the
+            // instant the wrist drops.
             let orientation = staticYawAdjustment(for: controller.handedness)
                 * wristOrientation
                 * orientationOffset(for: controller.handedness)
@@ -184,7 +199,15 @@ final class SurrealSpatialSession {
 
             var worldFromController = simd_float4x4(orientation)
             worldFromController.columns.3 = SIMD4<Float>(position.x, position.y, position.z, 1)
-            controller.setCalibration(worldFromController * pose.matrix.inverse)
+            var smoother = smoothers[controller.id] ?? CalibrationSmoother()
+            let calibration = smoother.update(
+                target: worldFromController,
+                devicePose: pose.matrix,
+                now: update.timestamp,
+                tuning: smoothingTuning
+            )
+            smoothers[controller.id] = smoother
+            controller.setCalibration(calibration)
             controller.setHandAuthoritative(true)
         }
     }

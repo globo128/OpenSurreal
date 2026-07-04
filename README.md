@@ -27,8 +27,9 @@ struct GameView: View {
     var body: some View {
         MyGameView()
             .sheet(isPresented: $showingControllerSettings) {
-                // Drop-in connect / pair / manage UI from OpenSurreal.
-                SurrealControllerView(session: session)
+                // Drop-in connect / pair / manage UI from OpenSurreal. onDone adds
+                // a Done toolbar button — sheets have no built-in dismiss control.
+                SurrealControllerView(session: session) { showingControllerSettings = false }
             }
             .task {
                 for await pose in session.poseUpdates {

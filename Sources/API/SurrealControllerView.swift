@@ -14,12 +14,26 @@ import SwiftUI
 ///
 /// The view observes the session, so connected/discovered controllers and Bluetooth
 /// state update live. It manages its own navigation chrome; embed it directly in a
-/// window or sheet.
+/// window or sheet. When presented in a sheet, pass `onDone` — sheets have no
+/// built-in dismiss control, and the handler surfaces a Done toolbar button:
+///
+/// ```swift
+/// .sheet(isPresented: $showingControllers) {
+///     SurrealControllerView(session: session) { showingControllers = false }
+/// }
+/// ```
 public struct SurrealControllerView: View {
     private let session: SurrealControllerSession
+    private let onDone: (() -> Void)?
 
-    public init(session: SurrealControllerSession) {
+    /// - Parameters:
+    ///   - session: The session to manage.
+    ///   - onDone: When non-nil, a Done toolbar button appears and calls this —
+    ///     use it to dismiss the sheet hosting the view. Leave nil when the view
+    ///     fills a window and needs no dismiss affordance.
+    public init(session: SurrealControllerSession, onDone: (() -> Void)? = nil) {
         self.session = session
+        self.onDone = onDone
     }
 
     public var body: some View {
@@ -39,6 +53,13 @@ public struct SurrealControllerView: View {
                 }
             }
             .navigationTitle("Surreal Controllers")
+            .toolbar {
+                if let onDone {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done", action: onDone)
+                    }
+                }
+            }
         }
         .onChange(of: session.connectionState, initial: true) { _, state in
             if state == .bothConnected {

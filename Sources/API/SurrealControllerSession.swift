@@ -68,6 +68,13 @@ public final class SurrealControllerSession {
     /// ``worldPoseUpdates`` will flow once controllers calibrate; the other cases tell
     /// you why it won't (unsupported device, denied authorization, ARKit error).
     public private(set) var spatialTrackingStatus: SpatialTrackingStatus = .notStarted
+
+    /// Fixed pitch correction applied to every controller's world pose, in degrees;
+    /// positive pitches the controller up (in the controller's own body frame).
+    /// Tune it if controllers render tilted in your app. Default 45.
+    public var pitchAdjustmentDegrees: Float = 55 {
+        didSet { applyPitchAdjustment() }
+    }
     #endif
 
     /// Creates a session and begins observing the Bluetooth radio.
@@ -79,6 +86,10 @@ public final class SurrealControllerSession {
         self.central = SurrealCentral()
         self.autoReconnect = autoReconnectLastControllers
         observeBluetooth()
+        #if os(visionOS)
+        // didSet doesn't fire during init, so push the default trim explicitly.
+        applyPitchAdjustment()
+        #endif
     }
 
     // MARK: Public streams
@@ -266,6 +277,13 @@ public final class SurrealControllerSession {
     // MARK: World tracking (visionOS)
 
     #if os(visionOS)
+    /// Pushes ``pitchAdjustmentDegrees`` into the spatial session's per-hand fine
+    /// trim (the pitch component, leaving yaw/roll trims untouched).
+    private func applyPitchAdjustment() {
+        spatial.leftWristOrientationOffsetDegrees.x = pitchAdjustmentDegrees
+        spatial.rightWristOrientationOffsetDegrees.x = pitchAdjustmentDegrees
+    }
+
     /// Starts ARKit hand tracking so connected controllers calibrate into the
     /// headset's world space and begin emitting on ``worldPoseUpdates``.
     ///
