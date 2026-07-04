@@ -19,10 +19,19 @@ enum SurrealProtocol {
     nonisolated(unsafe) static let buttonCharacteristicUUID = CBUUID(string: "6e401003-b5a3-f393-e0a9-e50e24dcca9e")
     nonisolated(unsafe) static let vibrationCharacteristicUUID = CBUUID(string: "6e401004-b5a3-f393-e0a9-e50e24dcca9e")
 
+    /// The controller also exposes the standard Bluetooth SIG **Battery Service**
+    /// (`0x180F`) with a single **Battery Level** characteristic (`0x2A19`): a `uint8`
+    /// percentage (`0…100`) that supports both read and notify. This is a *separate*
+    /// GATT service from the custom Surreal service above.
+    nonisolated(unsafe) static let batteryServiceUUID = CBUUID(string: "0000180f-0000-1000-8000-00805f9b34fb")
+    nonisolated(unsafe) static let batteryLevelCharacteristicUUID = CBUUID(string: "00002a19-0000-1000-8000-00805f9b34fb")
+
     /// Expected size of a pose packet: `uint64` timestamp + 17 × `float32`.
     static let posePacketSize = 76
     /// Expected size of a button packet: `uint64` timestamp + 5 × `uint8`.
     static let buttonPacketSize = 13
+    /// Expected size of a battery-level packet: a single `uint8` percentage.
+    static let batteryPacketSize = 1
 
     /// Full-scale raw value of the analog trigger and grip. Though the fields are
     /// `uint8`, the hardware reads ~0–127 at full input (verified on the trigger; the

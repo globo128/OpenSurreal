@@ -54,6 +54,7 @@ public final class SurrealControllerSession {
     @ObservationIgnored private let poseBroadcaster = StreamBroadcaster<ControllerPose>(bufferSize: 32)
     @ObservationIgnored private let worldPoseBroadcaster = StreamBroadcaster<WorldPose>(bufferSize: 32)
     @ObservationIgnored private let buttonBroadcaster = StreamBroadcaster<ButtonUpdate>(bufferSize: 64)
+    @ObservationIgnored private let batteryBroadcaster = StreamBroadcaster<BatteryUpdate>(bufferSize: 8)
     @ObservationIgnored private let stateBroadcaster = StreamBroadcaster<SurrealControllerEvent>(bufferSize: 16)
 
     @ObservationIgnored private let autoReconnect: Bool
@@ -115,6 +116,12 @@ public final class SurrealControllerSession {
     /// Button/trigger/joystick snapshots from every connected controller, each
     /// tagged with its hand.
     public var buttonUpdates: AsyncStream<ButtonUpdate> { buttonBroadcaster.stream() }
+
+    /// Battery-level readings from every connected controller, each tagged with its
+    /// hand. Emits once per controller shortly after it connects (the initial read),
+    /// then again whenever a controller's level changes. Reports percentage only —
+    /// the standard Battery Service carries no charging state.
+    public var batteryUpdates: AsyncStream<BatteryUpdate> { batteryBroadcaster.stream() }
 
     // MARK: Connection state
 
@@ -254,6 +261,7 @@ public final class SurrealControllerSession {
             poses: poseBroadcaster,
             worldPoses: worldPoseBroadcaster,
             buttons: buttonBroadcaster,
+            battery: batteryBroadcaster,
             onHoldChanged: { [weak self] hand, held in self?.handleHoldChange(hand, held) },
             onTerminated: { [weak self] id in self?.remove(id: id) }
         )

@@ -19,6 +19,9 @@ final class ConnectedController: Identifiable {
     /// Whether the controller is still connected. Becomes `false` as it disconnects,
     /// just before it leaves the session's connected list.
     private(set) var isConnected = true
+    /// Latest battery level as a percentage (`0…100`), or `nil` until the first
+    /// reading arrives (or if the controller lacks the standard Battery Service).
+    private(set) var batteryLevel: UInt8?
 
     @ObservationIgnored private var tasks: [Task<Void, Never>] = []
     @ObservationIgnored private let onHoldChanged: @MainActor (Handedness, Bool) -> Void
@@ -29,6 +32,7 @@ final class ConnectedController: Identifiable {
         poses: StreamBroadcaster<ControllerPose>,
         worldPoses: StreamBroadcaster<WorldPose>,
         buttons: StreamBroadcaster<ButtonUpdate>,
+        battery: StreamBroadcaster<BatteryUpdate>,
         onHoldChanged: @escaping @MainActor (Handedness, Bool) -> Void,
         onTerminated: @escaping @MainActor (UUID) -> Void
     ) {
@@ -38,13 +42,14 @@ final class ConnectedController: Identifiable {
         self.controller = controller
         self.onHoldChanged = onHoldChanged
         self.onTerminated = onTerminated
-        startForwarding(poses: poses, worldPoses: worldPoses, buttons: buttons)
+        startForwarding(poses: poses, worldPoses: worldPoses, buttons: buttons, battery: battery)
     }
 
     private func startForwarding(
         poses: StreamBroadcaster<ControllerPose>,
         worldPoses: StreamBroadcaster<WorldPose>,
-        buttons: StreamBroadcaster<ButtonUpdate>
+        buttons: StreamBroadcaster<ButtonUpdate>,
+        battery: StreamBroadcaster<BatteryUpdate>
     ) {
         // Each sample already carries its hand, so forwarding is a plain fan-in into
         // the session's aggregated streams. These don't touch `self`, so they end
@@ -60,6 +65,16 @@ final class ConnectedController: Identifiable {
         let buttonStream = controller.buttons
         tasks.append(Task {
             for await update in buttonStream { buttons.yield(update) }
+        })
+
+        // Battery fans into the aggregated stream *and* mirrors the latest level for
+        // the UI, so it holds `self` weakly (unlike the pure fan-ins above).
+        let batteryStream = controller.battery
+        tasks.append(Task { [weak self] in
+            for await update in batteryStream {
+                battery.yield(update)
+                self?.batteryLevel = update.level
+            }
         })
 
         // Mirror live state for the UI and notify the session of pause/resume and

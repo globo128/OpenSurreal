@@ -29,6 +29,11 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
     let worldPoses: AsyncStream<WorldPose>
     /// Button/trigger/joystick snapshots. Finishes on disconnect.
     let buttons: AsyncStream<ButtonUpdate>
+    /// Battery-level readings (percentage), from the standard Battery Service. Emits
+    /// once on connect (initial read) and again whenever the level changes. Buffers
+    /// only the newest value. Empty if the controller lacks the service. Finishes on
+    /// disconnect.
+    let battery: AsyncStream<BatteryUpdate>
     /// Yields once when the link drops, then finishes. (Connection success is
     /// implied by ``SurrealCentral/connect(_:)`` returning.)
     let disconnected: AsyncStream<Void>
@@ -43,6 +48,7 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
     private let poseContinuation: AsyncStream<ControllerPose>.Continuation
     private let worldPoseContinuation: AsyncStream<WorldPose>.Continuation
     private let buttonContinuation: AsyncStream<ButtonUpdate>.Continuation
+    private let batteryContinuation: AsyncStream<BatteryUpdate>.Continuation
     private let disconnectedContinuation: AsyncStream<Void>.Continuation
     private let holdStateContinuation: AsyncStream<Bool>.Continuation
 
@@ -59,6 +65,7 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
     private var poseCharacteristic: CBCharacteristic?
     private var buttonCharacteristic: CBCharacteristic?
     private var vibrationCharacteristic: CBCharacteristic?
+    private var batteryCharacteristic: CBCharacteristic?
     private var vibrationSequence: UInt16 = 0
     private var prepareContinuation: CheckedContinuation<Void, Error>?
     private var writeContinuation: CheckedContinuation<Void, Error>?
@@ -85,6 +92,10 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
         buttons = AsyncStream(bufferingPolicy: .bufferingNewest(32)) { buttonCont = $0 }
         buttonContinuation = buttonCont
 
+        var batteryCont: AsyncStream<BatteryUpdate>.Continuation!
+        battery = AsyncStream(bufferingPolicy: .bufferingNewest(1)) { batteryCont = $0 }
+        batteryContinuation = batteryCont
+
         var disconnectedCont: AsyncStream<Void>.Continuation!
         disconnected = AsyncStream(bufferingPolicy: .bufferingNewest(1)) { disconnectedCont = $0 }
         disconnectedContinuation = disconnectedCont
@@ -103,7 +114,10 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
             queue.async {
                 self.prepareContinuation = continuation
                 self.peripheral.delegate = self
-                self.peripheral.discoverServices([SurrealProtocol.serviceUUID])
+                self.peripheral.discoverServices([
+                    SurrealProtocol.serviceUUID,
+                    SurrealProtocol.batteryServiceUUID
+                ])
             }
         }
     }
@@ -247,6 +261,7 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
         poseContinuation.finish()
         worldPoseContinuation.finish()
         buttonContinuation.finish()
+        batteryContinuation.finish()
         holdStateContinuation.finish()
         disconnectedContinuation.yield(())
         disconnectedContinuation.finish()
@@ -281,7 +296,8 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
             finishPrepare(throwing: .connectionFailed(error.localizedDescription))
             return
         }
-        guard let service = peripheral.services?.first(where: { $0.uuid == SurrealProtocol.serviceUUID }) else {
+        let services = peripheral.services ?? []
+        guard let surreal = services.first(where: { $0.uuid == SurrealProtocol.serviceUUID }) else {
             finishPrepare(throwing: .serviceNotFound)
             return
         }
@@ -291,8 +307,13 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
                 SurrealProtocol.buttonCharacteristicUUID,
                 SurrealProtocol.vibrationCharacteristicUUID
             ],
-            for: service
+            for: surreal
         )
+        // The standard Battery Service is optional — its absence must never block
+        // controller readiness, so it's discovered independently of the Surreal service.
+        if let battery = services.first(where: { $0.uuid == SurrealProtocol.batteryServiceUUID }) {
+            peripheral.discoverCharacteristics([SurrealProtocol.batteryLevelCharacteristicUUID], for: battery)
+        }
     }
 
     func peripheral(
@@ -300,6 +321,23 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
+        // This delegate fires once per service. The Battery Service is optional and
+        // independent of controller readiness: handle it on its own and never let a
+        // failure (or its ordering relative to the Surreal service) fail `prepare`.
+        if service.uuid == SurrealProtocol.batteryServiceUUID {
+            guard error == nil else { return }
+            for characteristic in service.characteristics ?? []
+            where characteristic.uuid == SurrealProtocol.batteryLevelCharacteristicUUID {
+                batteryCharacteristic = characteristic
+                // Subscribe for live changes, and kick off a one-shot read for the
+                // current level — notify alone won't deliver a value until the level
+                // next changes.
+                peripheral.setNotifyValue(true, for: characteristic)
+                peripheral.readValue(for: characteristic)
+            }
+            return
+        }
+
         if let error {
             finishPrepare(throwing: .connectionFailed(error.localizedDescription))
             return
@@ -380,6 +418,11 @@ final class SurrealController: NSObject, CBPeripheralDelegate, @unchecked Sendab
         case SurrealProtocol.buttonCharacteristicUUID:
             if let update = try? ButtonUpdate(packet: data, handedness: handedness) {
                 buttonContinuation.yield(update)
+            }
+        case SurrealProtocol.batteryLevelCharacteristicUUID:
+            // Delivered both by the one-shot read on connect and by later notifications.
+            if let update = try? BatteryUpdate(packet: data, handedness: handedness) {
+                batteryContinuation.yield(update)
             }
         default:
             break

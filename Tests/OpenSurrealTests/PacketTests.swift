@@ -96,6 +96,24 @@ final class PacketTests: XCTestCase {
         XCTAssertThrowsError(try ButtonUpdate(packet: Data([0x00, 0x01, 0x02]), handedness: .left))
     }
 
+    // MARK: Battery parsing
+
+    func testBatteryParsing() throws {
+        let update = try BatteryUpdate(packet: Data([87]), handedness: .right)
+        XCTAssertEqual(update.handedness, .right)
+        XCTAssertEqual(update.level, 87)
+    }
+
+    func testBatteryParsingIgnoresTrailingBytes() throws {
+        // A single-byte packet is the contract; tolerate any extra trailing bytes.
+        let update = try BatteryUpdate(packet: Data([41, 0xFF]), handedness: .left)
+        XCTAssertEqual(update.level, 41)
+    }
+
+    func testBatteryRejectsShortPacket() {
+        XCTAssertThrowsError(try BatteryUpdate(packet: Data(), handedness: .left))
+    }
+
     // MARK: Pose parsing
 
     func testPoseParsingConvertsToRightHanded() throws {

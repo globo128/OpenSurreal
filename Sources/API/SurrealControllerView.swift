@@ -154,7 +154,11 @@ private struct ConnectedControllerRow: View {
 
     private var statusText: String {
         if !connected.isConnected { return "Disconnecting…" }
-        return connected.isHeld ? "Connected" : "Set down"
+        let state = connected.isHeld ? "Connected" : "Set down"
+        if let level = connected.batteryLevel {
+            return "\(state) · \(level)%"
+        }
+        return state
     }
 }
 
