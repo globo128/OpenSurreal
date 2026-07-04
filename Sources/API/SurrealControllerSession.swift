@@ -71,7 +71,7 @@ public final class SurrealControllerSession {
 
     /// Fixed pitch correction applied to every controller's world pose, in degrees;
     /// positive pitches the controller up (in the controller's own body frame).
-    /// Tune it if controllers render tilted in your app. Default 45.
+    /// Tune it if controllers render tilted in your app. Default 55.
     public var pitchAdjustmentDegrees: Float = 55 {
         didSet { applyPitchAdjustment() }
     }

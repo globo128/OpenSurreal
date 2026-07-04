@@ -71,6 +71,19 @@ for await event in session.stateUpdates {
 }
 ```
 
+## Haptics
+Send a haptic pulse from code with `vibrate` — for example in response to game events:
+
+```swift
+session.vibrate(.right, amplitude: 0.8, frequency: 170, duration: 0.1)
+```
+
+- `amplitude` is normalized `0...1`; `frequency` is Hz, clamped to the device's `20...300`; `duration` is seconds, raised to the device minimum of 30 ms.
+- Pass `.unspecified` to buzz every connected controller.
+- Calls are fire-and-forget and safe at high rates: a pulse requested while the device is already vibrating resolves as a no-op.
+
+The bundled `SurrealControllerView` also has a per-controller "Vibrate" test button.
+
 ## Reconnecting without a scan
 OpenSurreal remembers the last-connected **left** and **right** controller (each new connection replaces that hand's slot). 
 By default, a session reconnects to both the first time Bluetooth powers on — no scan, no UI. An idle controller reconnects the moment you turn it on. 
@@ -94,13 +107,21 @@ RealityView { content in
 
 `WorldPose.transform` is `worldFromController`, ready to drop onto a RealityKit `Entity` (also available decomposed as `.position` / `.orientation`). It flows only while spatial tracking is running and the matching hand is calibrated.
 
+If controllers render tilted in your app, tune the session's pitch correction. It's applied in the controller's own body frame (so it stays correct whichever way the controller points) and can be changed live:
+
+```swift
+session.pitchAdjustmentDegrees = 55   // positive pitches the controller up; default 55
+```
+
 ### How the fusion works
 World poses are a calculated metric that is derived from the player's wrist position when the wrists are in view of the Vision Pro's cameras:
 - **Position & orientation** come from the tracked wrist. Its position pushed forward onto the controller's body, and its orientation with a fixed per-hand correction so the controller points where it physically points. In testing, hand tracking is more stable and has less drift than relying on the controller's own positional data. While wrist-based position & orientation is active, `WorldPose.confidence` is reported as `1.0`.
 - On each update, the controller's own tracking frame is re-registered against the wrist, so the controller carries on seamlessly from the *same place* the instant the wrist is lost.
+- **The re-registration is adaptively smoothed** so hand-tracking jitter doesn't shake a controller that's held still. Noise-sized wrist/controller disagreements (millimetres, a degree or two) are damped hard; genuine misalignment corrects within a few frames; gross disagreement (a fresh pickup) snaps outright. This adds no lag to real motion at any speed — movement always rides the controller's own tracking at full rate, and the smoothing only acts on the alignment between the two tracking frames.
+- **For ~2 s after a pickup the calibration snaps straight to the wrist** instead of smoothing toward it: a controller's own tracker goes through a transient after sitting still, and per-frame wrist snapping masks it until it re-converges.
 When the wrist isn't tracked, the controller **coasts on its own tracking**, calibrated to the last moment the wrist was visible — and `WorldPose.confidence` reports the controller's own device confidence instead of `1.0`. It snaps back onto the wrist as soon as the hand reappears.
 **Velocity** is always the controller's own reported velocity (rotated into world axes), whichever source is driving position.
-**Held vs. released** is a derived state which is inferred from motion coherence: if the hand moves but the controller doesn't, the controller is assumed set down. In this case, the pose freezes where it sits (rather than chasing the empty hand) and the session reports `.paused`, then `.resumed` on pickup.
+**Held vs. released** is a derived state which is inferred from motion coherence: if the hand moves but the controller doesn't move — or rotate — with it, the controller is assumed set down. In this case, the pose freezes where it sits (rather than chasing the empty hand) and the session reports `.paused`, then `.resumed` on pickup. Rotation counts as evidence of holding because a controller lying on a surface can't rotate, and gyro-derived attitude stays trustworthy even while position tracking is still re-converging right after a pickup — for the same reason, "set down" verdicts are ignored during the post-pickup recovery window.
 
 ## Public API surface
 
@@ -110,8 +131,10 @@ When the wrist isn't tracked, the controller **coasts on its own tracking**, cal
 | | `stateUpdates` | `AsyncStream<SurrealControllerEvent>` — connection changes + pause/resume |
 | | `poseUpdates` / `worldPoseUpdates` / `buttonUpdates` | Aggregated `AsyncStream`s across both hands, each event tagged with `handedness` |
 | | `startSpatialTracking()` / `stopSpatialTracking()` (visionOS) | Run world-space calibration inside an `ImmersiveSpace` |
+| | `vibrate(_:amplitude:frequency:duration:)` | Haptic pulse for one hand (`.unspecified` = all); normalized amplitude, Hz, seconds |
+| | `pitchAdjustmentDegrees` (visionOS) | Body-frame pitch correction on world poses; positive pitches up, live-tunable (default 55) |
 | | `init(autoReconnectLastControllers:)` | Create a session (auto-reconnect defaults to `true`) |
-| `SurrealControllerView` | `init(session:)` | Drop-in SwiftUI connect / pair / manage UI |
+| `SurrealControllerView` | `init(session:onDone:)` | Drop-in SwiftUI connect / pair / manage UI; `onDone` adds a Done toolbar button (pass it when hosting in a sheet, which has no built-in dismiss control) |
 | `SurrealConnectionState` | `.disconnected` / `.connecting` / `.leftConnected` / `.rightConnected` / `.bothConnected` | Whole-session connection snapshot |
 | `SurrealControllerEvent` | `.connection(_:)` / `.paused(_:)` / `.resumed(_:)` | Events on `stateUpdates` |
 | `WorldPose` | `handedness` / `transform` / `position` / `orientation` / `confidence` / `linearVelocity` / `angularVelocity` / `acceleration` / `timestamp` | World-space pose sample (`confidence` is `1.0` while the wrist is authoritative; velocities rotated into world axes) |
